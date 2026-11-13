@@ -1,0 +1,119 @@
+# Build an UNSIGNED iOS .ipa of Yattee for sideloading (Sideloadly / AltStore / SideStore).
+# Put this file in your fork at .github/workflows/build-unsigned-ipa.yml
+# Run: Actions tab -> "Build unsigned iOS IPA" -> Run workflow.
+
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "macOS runner image (needs an Xcode new enough for the project)"
+        type: choice
+        default: macos-26
+        options:
+          - macos-26
+          - macos-latest
+          - macos-15
+      make_release:
+        description: "Also publish the IPA as a GitHub Release in this fork"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-unsigned-ipa
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select newest installed Xcode
+        run: |
+          echo "Installed Xcodes:"; ls -d /Applications/Xcode*.app || true
+          XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          xcodebuild -showsdks | grep -i iphoneos
+
+      - name: Read app version
+        id: ver
+        run: |
+          V=$(grep -m1 'MARKETING_VERSION' Yattee.xcodeproj/project.pbxproj | sed -E 's/.*= *([^;]+);/\1/' | tr -d '"')
+          echo "version=${V:-0.0}" >> "$GITHUB_OUTPUT"
+          echo "stamp=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: build/SourcePackages
+          key: spm-${{ runner.os }}-${{ hashFiles('**/Package.resolved') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Archive (no code signing)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project Yattee.xcodeproj \
+            -scheme Yattee \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/Yattee.xcarchive \
+            -clonedSourcePackagesDirPath build/SourcePackages \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            | tee build/xcodebuild.log | grep -E 'error:|warning: .*deprecated|\*\* ARCHIVE' || true
+          test -d build/Yattee.xcarchive/Products/Applications/Yattee.app || {
+            echo "::error::Archive failed - see the xcodebuild-log artifact"; tail -n 200 build/xcodebuild.log; exit 1; }
+
+      - name: Package .ipa
+        id: ipa
+        run: |
+          NAME="Yattee-${{ steps.ver.outputs.version }}-unsigned-${{ steps.ver.outputs.stamp }}.ipa"
+          mkdir -p build/ipa/Payload
+          cp -R build/Yattee.xcarchive/Products/Applications/Yattee.app build/ipa/Payload/
+          # strip any leftover signature so sideload tools re-sign cleanly
+          find build/ipa/Payload -name "_CodeSignature" -type d -prune -exec rm -rf {} +
+          (cd build/ipa && zip -qry "../$NAME" Payload)
+          ls -lh "build/$NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.ipa.outputs.name }}
+          path: build/${{ steps.ipa.outputs.name }}
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: build/xcodebuild.log
+          if-no-files-found: ignore
+
+      - name: Publish GitHub Release
+        if: inputs.make_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: unsigned-${{ steps.ver.outputs.stamp }}
+          name: Yattee ${{ steps.ver.outputs.version }} unsigned (${{ steps.ver.outputs.stamp }})
+          prerelease: true
+          files: build/${{ steps.ipa.outputs.name }}
+          body: |
+            Unsigned build from `${{ github.sha }}`. Sign & install with Sideloadly / AltStore / SideStore.
