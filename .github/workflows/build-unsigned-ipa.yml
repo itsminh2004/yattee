@@ -10,8 +10,9 @@ on:
       runner:
         description: "macOS runner image (needs an Xcode new enough for the project)"
         type: choice
-        default: macos-26
+        default: macos-27
         options:
+          - macos-27
           - macos-26
           - macos-latest
           - macos-15
